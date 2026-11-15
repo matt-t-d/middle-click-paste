@@ -107,13 +107,28 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     })
 }
 
+/// How long `run` waits for Accessibility permission before exiting to be restarted.
+const PERMISSION_WAIT: Duration = Duration::from_secs(30);
+
 fn run(cfg: Config) -> Result<(), String> {
     if !ax::is_trusted(true) {
         eprintln!(
             "Waiting for Accessibility permission: enable middle-click-paste (or the terminal \
              running it) in System Settings > Privacy & Security > Accessibility."
         );
+        // macOS often keeps answering "not trusted" to a process that started
+        // untrusted, even after the grant. Give up after a while and exit non-zero:
+        // under launchd (KeepAlive) a fresh process starts and sees the grant.
+        let give_up = std::time::Instant::now() + PERMISSION_WAIT;
         while !ax::is_trusted(false) {
+            if std::time::Instant::now() >= give_up {
+                return Err(
+                    "still no Accessibility permission; exiting so a fresh process can pick \
+                     up a new grant (the LaunchAgent restarts automatically; from a terminal, \
+                     run again)"
+                        .into(),
+                );
+            }
             std::thread::sleep(Duration::from_secs(2));
         }
         eprintln!("Accessibility permission granted.");
