@@ -175,13 +175,20 @@ fn main() -> ExitCode {
             Ok(())
         }
         Ok(Command::Run(cfg)) => run(cfg),
-        Ok(Command::Install(extra)) => launchd::install(&extra).map(|(path, changed)| {
+        Ok(Command::Install(extra)) => launchd::install(&extra).map(|(path, outcome)| {
             println!("Installed {}: it will start now and at every login.", path.display());
-            if changed {
+            if outcome.signed {
+                println!(
+                    "Signed with '{}': an Accessibility grant made for a signed install\n\
+                     carries over to later installs.",
+                    launchd::SIGNING_IDENTITY
+                );
+            } else if outcome.changed {
                 println!(
                     "The binary changed, so macOS may not trust it yet. In System Settings >\n\
                      Privacy & Security > Accessibility, remove any old middle-click-paste\n\
-                     entry and add {}.",
+                     entry and add {}.\n\
+                     To avoid this on every install, run scripts/create-signing-cert.sh once.",
                     path.display()
                 );
             }

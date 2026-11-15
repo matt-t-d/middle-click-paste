@@ -24,14 +24,14 @@ const INSTALL_PATH: &str = ".local/bin/middle-click-paste";
 /// Copy the current executable to [`INSTALL_PATH`], write
 /// ~/Library/LaunchAgents/<label>.plist pointing at the copy (with `extra_args`
 /// appended after the `run` subcommand) and load it.
-/// Returns the installed binary's path and whether it changed.
-pub fn install(extra_args: &[String]) -> Result<(PathBuf, bool), String> {
+/// Returns the installed binary's path and what happened to it.
+pub fn install(extra_args: &[String]) -> Result<(PathBuf, Installed), String> {
     let home = home_dir()?;
     let current = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("cannot determine path of the current executable: {e}"))?;
     let installed = home.join(INSTALL_PATH);
-    let changed = copy_binary(&current, &installed)?;
+    let outcome = copy_binary(&current, &installed, sign)?;
     let exe = installed
         .to_str()
         .ok_or("install path is not valid UTF-8")?
@@ -73,7 +73,7 @@ pub fn install(extra_args: &[String]) -> Result<(PathBuf, bool), String> {
         }
         let out = launchctl(&["bootstrap", &domain, &plist_str])?;
         if out.status.success() {
-            return Ok((installed, changed));
+            return Ok((installed, outcome));
         }
         last_err = describe_failure(&out);
     }
@@ -103,29 +103,55 @@ fn remove_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Copy `src` to `dest` unless `dest` already has identical contents (so an
-/// unchanged reinstall keeps its Accessibility grant). The new file is written
-/// next to `dest` and renamed over it, so a running copy is never modified in place.
-/// Returns whether `dest` changed.
-fn copy_binary(src: &Path, dest: &Path) -> Result<bool, String> {
+/// Self-signed code-signing identity created by `scripts/create-signing-cert.sh`.
+pub const SIGNING_IDENTITY: &str = "middle-click-paste dev";
+
+/// Sign `path` with [`SIGNING_IDENTITY`] and a fixed identifier, so macOS keys the
+/// Accessibility grant to the certificate rather than the build's content hash.
+/// False if the identity doesn't exist or signing fails.
+fn sign(path: &Path) -> bool {
+    Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", SIGNING_IDENTITY, "--identifier", LABEL])
+        .arg(path)
+        .output()
+        .map_or(false, |out| out.status.success())
+}
+
+/// What `install` did with the binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Installed {
+    /// The installed file changed.
+    pub changed: bool,
+    /// Signed with [`SIGNING_IDENTITY`]: the Accessibility grant carries over.
+    pub signed: bool,
+}
+
+/// Copy `src` to `dest` and `sign` the copy. The new file is written next to
+/// `dest` and renamed over it, so a running copy is never modified in place. If
+/// the result is identical to `dest`, `dest` is left alone.
+fn copy_binary(src: &Path, dest: &Path, sign: impl Fn(&Path) -> bool) -> Result<Installed, String> {
     if src == dest {
-        return Ok(false);
+        return Ok(Installed { changed: false, signed: sign(dest) });
     }
     let bytes = fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    if fs::read(dest).map_or(false, |existing| existing == bytes) {
-        return Ok(false);
-    }
     let dir = dest.parent().ok_or("install path has no parent directory")?;
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!(".middle-click-paste.{}.tmp", std::process::id()));
-    let result = fs::write(&tmp, &bytes)
-        .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)))
-        .and_then(|()| fs::rename(&tmp, dest));
-    if let Err(e) = result {
+    let fail = |e: std::io::Error| {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot install binary to {}: {e}", dest.display()));
+        format!("cannot install binary to {}: {e}", dest.display())
+    };
+    fs::write(&tmp, &bytes)
+        .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)))
+        .map_err(fail)?;
+    let signed = sign(&tmp);
+    let new = fs::read(&tmp).map_err(fail)?;
+    if fs::read(dest).map_or(false, |existing| existing == new) {
+        let _ = fs::remove_file(&tmp);
+        return Ok(Installed { changed: false, signed });
     }
-    Ok(true)
+    fs::rename(&tmp, dest).map_err(fail)?;
+    Ok(Installed { changed: true, signed })
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -295,15 +321,28 @@ mod tests {
         let dest = dir.join("sub/dest-bin");
         fs::create_dir_all(&dir).unwrap();
 
+        let unsigned = |_: &Path| false;
+        let copy = |sign: &dyn Fn(&Path) -> bool| copy_binary(&src, &dest, sign).unwrap();
+        let changed = |signed| Installed { changed: true, signed };
+        let same = |signed| Installed { changed: false, signed };
+
         fs::write(&src, b"v1").unwrap();
-        assert!(copy_binary(&src, &dest).unwrap(), "first copy");
+        assert_eq!(copy(&unsigned), changed(false), "first copy");
         assert_eq!(fs::read(&dest).unwrap(), b"v1");
         assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o755);
-        assert!(!copy_binary(&src, &dest).unwrap(), "identical: untouched");
+        assert_eq!(copy(&unsigned), same(false), "identical: untouched");
         fs::write(&src, b"v2").unwrap();
-        assert!(copy_binary(&src, &dest).unwrap(), "changed: replaced");
+        assert_eq!(copy(&unsigned), changed(false), "changed: replaced");
         assert_eq!(fs::read(&dest).unwrap(), b"v2");
-        assert!(!copy_binary(&dest, &dest).unwrap(), "self-copy is a no-op");
+
+        // The signer runs on the copy, before it replaces dest.
+        let fake_sign = |p: &Path| fs::write(p, b"v2+sig").is_ok();
+        assert_eq!(copy(&fake_sign), changed(true));
+        assert_eq!(fs::read(&dest).unwrap(), b"v2+sig");
+        assert_eq!(fs::read(&src).unwrap(), b"v2", "source untouched");
+        assert_eq!(copy(&fake_sign), same(true), "identical after signing: untouched");
+
+        assert_eq!(copy_binary(&dest, &dest, unsigned).unwrap(), same(false), "self-copy");
         assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1, "no temp left");
 
         fs::remove_dir_all(&dir).unwrap();

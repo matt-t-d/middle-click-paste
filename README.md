@@ -23,11 +23,19 @@ Accessibility). On first run macOS prompts for it and the program waits up to
 30 seconds for it; macOS doesn't always tell an already-running process about a
 grant, so it then exits and the LaunchAgent restarts it (from a terminal, run it
 again). Run from a terminal, the permission belongs to the terminal app;
-installed as a LaunchAgent, it belongs to `~/.local/bin/middle-click-paste`.
-The grant is tied to that exact binary, so `cargo build` doesn't affect the
-installed daemon. Running `install` after a code change replaces the copy, and
-then the grant has to be redone: remove the old entry and add the binary again.
-`install` leaves an identical copy untouched, so its grant stays valid.
+installed as a LaunchAgent, it belongs to `~/.local/bin/middle-click-paste`,
+so `cargo build` doesn't affect the installed daemon.
+
+By default macOS ties the grant to the exact build, so `install`ing new code
+means removing the old entry and adding the binary again. To avoid that, create
+a self-signed signing identity once:
+
+```sh
+./scripts/create-signing-cert.sh   # adds "middle-click-paste dev" to the login keychain
+```
+
+`install` then signs the copy with it, macOS ties the grant to the certificate,
+and after one last grant, later installs keep it.
 
 Logs for the LaunchAgent go to `~/Library/Logs/middle-click-paste.log`.
 
