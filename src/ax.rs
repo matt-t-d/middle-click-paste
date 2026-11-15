@@ -9,6 +9,7 @@ use crate::ffi::{
     CFRetain, CFStringRef, CFTypeID, CFTypeRef,
 };
 use std::ffi::{c_char, c_void};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Result of asking the focused UI element for its selected text.
@@ -62,6 +63,12 @@ extern "C" {
     fn AXUIElementCreateSystemWide() -> AXUIElementRef;
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, seconds: f32) -> AXError;
+    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
+    ) -> AXError;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -170,6 +177,11 @@ const GLOBAL_TIMEOUT_SECS: f32 = 0.12;
 const TARGET_BUDGET: Duration = Duration::from_millis(150);
 /// Per-element timeout for reading the selection from the focused element.
 const SELECTION_TIMEOUT_SECS: f32 = 0.25;
+/// How long `target_at` waits for a sleeping Chromium web tree to appear.
+const WAKE_WAIT: Duration = Duration::from_millis(300);
+const WAKE_POLL: Duration = Duration::from_millis(20);
+/// Pause before re-reading a selection AX couldn't report, in case the app was asleep.
+const SELECTION_WAKE_WAIT: Duration = Duration::from_millis(80);
 /// Maximum number of elements inspected by `target_at` (hit element + ancestors).
 const MAX_WALK: usize = 10;
 
@@ -204,6 +216,53 @@ fn copy_element_attr(element: &Cf, name: &str) -> Result<Cf, AXError> {
         Ok(v)
     } else {
         Err(kAXErrorNoValue)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chromium / Electron accessibility wake-up
+// ---------------------------------------------------------------------------
+
+/// PIDs we've already asked to expose their full AX tree.
+static WOKEN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Ask a Chromium/Electron app to build its web-content accessibility tree.
+///
+/// Chromium browsers (Vivaldi, Chrome...) drop that tree whenever they see user
+/// input but no accessibility client, after which a page is a bare AXScrollArea.
+/// Querying the *application* element wakes them (~25ms later); hit tests alone
+/// never do. So this runs on every call. Electron apps additionally need
+/// `AXManualAccessibility`, set once per process; other apps reject it harmlessly.
+fn wake_app(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    let Some(app) = Cf::owned(unsafe { AXUIElementCreateApplication(pid) }) else {
+        return;
+    };
+    unsafe { AXUIElementSetMessagingTimeout(app.0, GLOBAL_TIMEOUT_SECS) };
+    let _ = copy_attr(&app, "AXRole");
+
+    let first_time = {
+        let mut woken = WOKEN.lock().unwrap_or_else(|e| e.into_inner());
+        if woken.contains(&pid) {
+            false
+        } else {
+            woken.push(pid);
+            true
+        }
+    };
+    if first_time {
+        if let Some(attr) = Cf::owned(cfstring("AXManualAccessibility")) {
+            unsafe { AXUIElementSetAttributeValue(app.0, attr.0, kCFBooleanTrue) };
+        }
+    }
+}
+
+fn wake_owner(element: &Cf) {
+    let mut pid = 0;
+    if unsafe { AXUIElementGetPid(element.0, &mut pid) } == kAXErrorSuccess {
+        wake_app(pid);
     }
 }
 
@@ -315,7 +374,23 @@ fn is_text_entry_role(role: &str) -> bool {
 }
 
 /// Selected text of the system-wide focused element.
+/// Not for the event-tap thread: may sleep briefly while a Chromium app wakes up.
 pub fn selected_text() -> Selection {
+    let pid = frontmost_pid();
+    if let Some(pid) = pid {
+        wake_app(pid);
+    }
+    match read_selection() {
+        // Possibly a sleeping Chromium app (see `wake_app`): give it time to wake.
+        Selection::Unsupported if pid.is_some() => {
+            std::thread::sleep(SELECTION_WAKE_WAIT);
+            read_selection()
+        }
+        other => other,
+    }
+}
+
+fn read_selection() -> Selection {
     let Some(element) = focused_element() else {
         return Selection::Unsupported;
     };
@@ -482,22 +557,55 @@ fn window_is_opaque(window: &Cf, deadline: Instant) -> bool {
     true
 }
 
-/// Classify the element at global screen coordinates (top-left origin, as in CGEvent locations).
-/// Must return quickly (<= ~150ms worst case): it is called from the event-tap callback.
-pub fn target_at(x: f64, y: f64) -> Target {
-    let deadline = Instant::now() + TARGET_BUDGET;
-    let Some(sys) = system_wide() else {
-        return Target::Unknown;
-    };
+fn element_at(sys: &Cf, x: f64, y: f64) -> Option<Cf> {
     let mut hit: AXUIElementRef = std::ptr::null();
     let err = unsafe { AXUIElementCopyElementAtPosition(sys.0, x as f32, y as f32, &mut hit) };
     let hit = Cf::owned(hit);
-    if err != kAXErrorSuccess {
-        return Target::Unknown;
+    if err == kAXErrorSuccess {
+        hit
+    } else {
+        None
     }
-    let (Some(mut element), Some(attrs)) = (hit, walk_attrs()) else {
+}
+
+/// The element under the point, waiting for a sleeping Chromium tree to wake.
+///
+/// A sleeping Chromium page is a bare AXScrollArea (see [`wake_app`]). After
+/// waking the app, a hit landing directly on a scroll area is re-tried for up to
+/// [`WAKE_WAIT`].
+fn hit_test(sys: &Cf, attrs: &Cf, x: f64, y: f64) -> Option<Cf> {
+    let element = element_at(sys, x, y)?;
+    wake_owner(&element);
+    let wait_until = Instant::now() + WAKE_WAIT;
+    let mut element = element;
+    loop {
+        unsafe { AXUIElementSetMessagingTimeout(element.0, GLOBAL_TIMEOUT_SECS) };
+        let bare_scroll_area = matches!(
+            describe(&element, attrs),
+            Ok(Info { role: Some(ref role), .. }) if role == "AXScrollArea"
+        );
+        if !bare_scroll_area || Instant::now() >= wait_until {
+            return Some(element);
+        }
+        std::thread::sleep(WAKE_POLL);
+        element = element_at(sys, x, y)?;
+    }
+}
+
+/// Classify the element at global screen coordinates (top-left origin, as in CGEvent locations).
+/// Must return quickly: it is called from the event-tap callback. Worst case is about
+/// `WAKE_WAIT + TARGET_BUDGET` (~450ms), when waiting for a sleeping Chromium tree.
+pub fn target_at(x: f64, y: f64) -> Target {
+    let Some(sys) = system_wide() else {
         return Target::Unknown;
     };
+    let Some(attrs) = walk_attrs() else {
+        return Target::Unknown;
+    };
+    let Some(mut element) = hit_test(&sys, &attrs, x, y) else {
+        return Target::Unknown;
+    };
+    let deadline = Instant::now() + TARGET_BUDGET;
 
     for depth in 0..MAX_WALK {
         // Give each request only what is left of the overall budget.
@@ -602,7 +710,7 @@ mod tests {
             let target = target_at(x, y);
             let elapsed = start.elapsed();
             eprintln!("target_at({x}, {y}) = {target:?} trusted={trusted} elapsed={elapsed:?}");
-            assert!(elapsed < Duration::from_millis(400), "took {elapsed:?}");
+            assert!(elapsed < Duration::from_millis(600), "took {elapsed:?}");
             if !trusted {
                 assert_eq!(target, Target::Unknown);
             }

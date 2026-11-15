@@ -132,7 +132,19 @@ fn run(cfg: Config) -> Result<(), String> {
         eprintln!("running: {cfg:?}");
     }
     input::run_tap(Box::new(move |event| {
-        engine::on_event(event, &cfg, &buffer, &jobs_tx, ax::target_at)
+        let target_at = |x: f64, y: f64| {
+            let start = std::time::Instant::now();
+            let target = ax::target_at(x, y);
+            if cfg.verbose {
+                eprintln!("middle-click at ({x:.0}, {y:.0}): {target:?} in {:?}", start.elapsed());
+            }
+            target
+        };
+        let verdict = engine::on_event(event, &cfg, &buffer, &jobs_tx, target_at);
+        if cfg.verbose && matches!(event, input::Event::MiddleClick { .. }) {
+            eprintln!("middle-click: {verdict:?}");
+        }
+        verdict
     }))
 }
 
