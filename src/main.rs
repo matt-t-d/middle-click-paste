@@ -160,9 +160,16 @@ fn main() -> ExitCode {
             Ok(())
         }
         Ok(Command::Run(cfg)) => run(cfg),
-        Ok(Command::Install(extra)) => launchd::install(&extra).map(|()| {
-            println!("Installed: middle-click-paste will start now and at every login.");
-            println!("Grant it Accessibility permission if macOS asks.");
+        Ok(Command::Install(extra)) => launchd::install(&extra).map(|(path, changed)| {
+            println!("Installed {}: it will start now and at every login.", path.display());
+            if changed {
+                println!(
+                    "The binary changed, so macOS may not trust it yet. In System Settings >\n\
+                     Privacy & Security > Accessibility, remove any old middle-click-paste\n\
+                     entry and add {}.",
+                    path.display()
+                );
+            }
         }),
         Ok(Command::Uninstall) => launchd::uninstall().map(|()| println!("Uninstalled.")),
         Err(e) => Err(e),

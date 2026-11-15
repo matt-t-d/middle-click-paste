@@ -1,7 +1,8 @@
 //! LaunchAgent install/uninstall so the daemon starts at login.
 
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread::sleep;
 use std::time::Duration;
@@ -13,16 +14,27 @@ extern "C" {
     fn getuid() -> u32;
 }
 
-/// Write ~/Library/LaunchAgents/<label>.plist pointing at the current executable
-/// (with `extra_args` appended after the `run` subcommand) and load it.
-pub fn install(extra_args: &[String]) -> Result<(), String> {
+/// Where `install` puts the binary the LaunchAgent runs, relative to $HOME.
+///
+/// Accessibility permission is tied to the binary's (ad-hoc) code signature, which
+/// changes on every build. Running a copy that only `install` replaces keeps the
+/// grant across `cargo build`s.
+const INSTALL_PATH: &str = ".local/bin/middle-click-paste";
+
+/// Copy the current executable to [`INSTALL_PATH`], write
+/// ~/Library/LaunchAgents/<label>.plist pointing at the copy (with `extra_args`
+/// appended after the `run` subcommand) and load it.
+/// Returns the installed binary's path and whether it changed.
+pub fn install(extra_args: &[String]) -> Result<(PathBuf, bool), String> {
     let home = home_dir()?;
-    let exe = std::env::current_exe()
+    let current = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("cannot determine path of the current executable: {e}"))?;
-    let exe = exe
+    let installed = home.join(INSTALL_PATH);
+    let changed = copy_binary(&current, &installed)?;
+    let exe = installed
         .to_str()
-        .ok_or("executable path is not valid UTF-8")?
+        .ok_or("install path is not valid UTF-8")?
         .to_string();
 
     let agents_dir = home.join("Library/LaunchAgents");
@@ -61,7 +73,7 @@ pub fn install(extra_args: &[String]) -> Result<(), String> {
         }
         let out = launchctl(&["bootstrap", &domain, &plist_str])?;
         if out.status.success() {
-            return Ok(());
+            return Ok((installed, changed));
         }
         last_err = describe_failure(&out);
     }
@@ -79,11 +91,41 @@ pub fn uninstall() -> Result<(), String> {
     let plist_path = home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{LABEL}.plist"));
-    match fs::remove_file(&plist_path) {
+    remove_if_present(&plist_path)?;
+    remove_if_present(&home_dir()?.join(INSTALL_PATH))
+}
+
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot remove {}: {e}", plist_path.display())),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
     }
+}
+
+/// Copy `src` to `dest` unless `dest` already has identical contents (so an
+/// unchanged reinstall keeps its Accessibility grant). The new file is written
+/// next to `dest` and renamed over it, so a running copy is never modified in place.
+/// Returns whether `dest` changed.
+fn copy_binary(src: &Path, dest: &Path) -> Result<bool, String> {
+    if src == dest {
+        return Ok(false);
+    }
+    let bytes = fs::read(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    if fs::read(dest).map_or(false, |existing| existing == bytes) {
+        return Ok(false);
+    }
+    let dir = dest.parent().ok_or("install path has no parent directory")?;
+    fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".middle-click-paste.{}.tmp", std::process::id()));
+    let result = fs::write(&tmp, &bytes)
+        .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)))
+        .and_then(|()| fs::rename(&tmp, dest));
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("cannot install binary to {}: {e}", dest.display()));
+    }
+    Ok(true)
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -243,6 +285,28 @@ mod tests {
     fn no_extra_args() {
         let p = generate_plist("/bin/x", &[], "/tmp/l");
         assert!(p.contains("<string>/bin/x</string>\n\t\t<string>run</string>\n\t</array>"));
+    }
+
+    #[test]
+    fn copy_binary_skips_identical_and_replaces_changed() {
+        let dir = std::env::temp_dir().join(format!("mcp-copy-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let src = dir.join("src-bin");
+        let dest = dir.join("sub/dest-bin");
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(&src, b"v1").unwrap();
+        assert!(copy_binary(&src, &dest).unwrap(), "first copy");
+        assert_eq!(fs::read(&dest).unwrap(), b"v1");
+        assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!copy_binary(&src, &dest).unwrap(), "identical: untouched");
+        fs::write(&src, b"v2").unwrap();
+        assert!(copy_binary(&src, &dest).unwrap(), "changed: replaced");
+        assert_eq!(fs::read(&dest).unwrap(), b"v2");
+        assert!(!copy_binary(&dest, &dest).unwrap(), "self-copy is a no-op");
+        assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1, "no temp left");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Writes a sample for manual `plutil -lint` when MCP_PLIST_OUT is set.

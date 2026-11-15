@@ -14,15 +14,18 @@ hand-written FFI.
 ```sh
 cargo build --release
 ./target/release/middle-click-paste            # run in the foreground
-./target/release/middle-click-paste install    # start now and at every login
-./target/release/middle-click-paste uninstall
+./target/release/middle-click-paste install    # copy to ~/.local/bin, start now and at every login
+./target/release/middle-click-paste uninstall  # remove the LaunchAgent and the copy
 ```
 
 It needs Accessibility permission (System Settings > Privacy & Security >
 Accessibility). On first run macOS prompts for it and the program waits until
 it is granted. Run from a terminal, the permission belongs to the terminal app;
-installed as a LaunchAgent, it belongs to the binary itself. Rebuilding the
-binary can invalidate the grant, in which case remove and re-add it.
+installed as a LaunchAgent, it belongs to `~/.local/bin/middle-click-paste`.
+The grant is tied to that exact binary, so `cargo build` doesn't affect the
+installed daemon. Running `install` after a code change replaces the copy, and
+then the grant has to be redone: remove the old entry and add the binary again.
+`install` leaves an identical copy untouched, so its grant stays valid.
 
 Logs for the LaunchAgent go to `~/Library/Logs/middle-click-paste.log`.
 
