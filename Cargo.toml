@@ -1,0 +1,13 @@
+[package]
+name = "middle-click-paste"
+version = "0.1.0"
+edition = "2021"
+description = "Linux-style select-to-copy / middle-click-to-paste for macOS, with its own buffer separate from the system clipboard"
+license = "MIT"
+
+# Deliberately dependency-free: all macOS APIs are reached through hand-written FFI.
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
