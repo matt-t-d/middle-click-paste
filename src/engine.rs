@@ -15,6 +15,9 @@ use crate::input::{Event, Gesture, Verdict};
 pub struct Config {
     /// Paste on every middle-click, not only over editable text.
     pub always: bool,
+    /// Paste only where Accessibility positively reports editable text. Without this,
+    /// windows that are opaque to Accessibility (GPU terminals, ...) also get pastes.
+    pub strict: bool,
     /// When Accessibility can't report the selection, borrow the clipboard with a
     /// synthetic Cmd+C (and put the clipboard back afterwards).
     pub copy_fallback: bool,
@@ -73,8 +76,12 @@ pub fn on_event(
             if buffer.lock().unwrap().is_empty() {
                 return Verdict::Pass;
             }
-            if !cfg.always && target_at(x, y) != Target::Text {
-                return Verdict::Pass;
+            if !cfg.always {
+                match target_at(x, y) {
+                    Target::Text => {}
+                    Target::Unknown if !cfg.strict => {}
+                    _ => return Verdict::Pass,
+                }
             }
             match jobs.send(Job::Paste { x, y }) {
                 Ok(()) => Verdict::Swallow,
@@ -252,7 +259,8 @@ mod tests {
         fn sleep(&self, _d: Duration) {}
     }
 
-    const CFG: Config = Config { always: false, copy_fallback: true, verbose: false };
+    const CFG: Config =
+        Config { always: false, strict: false, copy_fallback: true, verbose: false };
 
     fn run(fake: &Fake, cfg: &Config, buffer: &Buffer, jobs: &[Job]) {
         let (tx, rx) = channel();
@@ -358,7 +366,10 @@ mod tests {
 
         assert_eq!(decide(click, &CFG, &full, Target::Text), (Verdict::Swallow, paste.clone()));
         assert_eq!(decide(click, &CFG, &full, Target::NotText), (Verdict::Pass, vec![]));
-        assert_eq!(decide(click, &CFG, &full, Target::Unknown), (Verdict::Pass, vec![]));
+        assert_eq!(decide(click, &CFG, &full, Target::Unknown), (Verdict::Swallow, paste.clone()));
+        let strict = Config { strict: true, ..CFG };
+        assert_eq!(decide(click, &strict, &full, Target::Unknown), (Verdict::Pass, vec![]));
+        assert_eq!(decide(click, &strict, &full, Target::Text), (Verdict::Swallow, paste.clone()));
         assert_eq!(decide(click, &CFG, &buffer_with(""), Target::Text), (Verdict::Pass, vec![]));
 
         let always = Config { always: true, ..CFG };

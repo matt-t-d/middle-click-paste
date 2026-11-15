@@ -26,6 +26,8 @@ USAGE:
 OPTIONS:
     --always             Paste on every middle-click, not just over editable text
                          (breaks middle-click on links and tabs)
+    --strict             Paste only where Accessibility reports editable text; by default
+                         windows it can't see into (e.g. GPU terminals) get pastes too
     --no-copy-fallback   Never send Cmd+C to read a selection; only use Accessibility
     -v, --verbose        Log captures and pastes to stderr
     -h, --help           Show this help
@@ -85,12 +87,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         Some(s @ ("run" | "install" | "uninstall")) => (s, &args[1..]),
         _ => ("run", args),
     };
-    let mut cfg = Config { always: false, copy_fallback: true, verbose: false };
+    let mut cfg = Config { always: false, strict: false, copy_fallback: true, verbose: false };
     for arg in rest {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--always" => cfg.always = true,
+            "--strict" => cfg.strict = true,
             "--no-copy-fallback" => cfg.copy_fallback = false,
             "-v" | "--verbose" => cfg.verbose = true,
             other => return Err(format!("unknown argument '{other}' (try --help)")),
